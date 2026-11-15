@@ -1,0 +1,212 @@
+# 📊 Esquemagrama Arquitetural: Backend Industrial Siderúrgico
+
+Este documento contém os diagramas esquemáticos visuais (usando sintaxe padrão Mermaid) que detalham o fluxo operacional, camadas DDD, pipeline de middlewares e funcionamento do compactador de JSON.
+
+---
+
+## 🏗️ 1. Diagrama Geral das Camadas DDD (Inversão de Dependências)
+
+```mermaid
+flowchart TD
+    subgraph UI_Clients ["Clientes / Dashboards Industriais"]
+        ClientWeb["Frontend Angular / Dashboard"]
+        ClientSwagger["Swagger UI / OpenAPI"]
+    end
+
+    subgraph API_Layer ["SteelIndustry.API"]
+        RootCtrl["RootController (/)"]
+        AuthCtrl["AuthController"]
+        UsersCtrl["UsersController"]
+        MatCtrl["MaterialsController"]
+        PerfMid["PerformanceMetricsMiddleware"]
+        JwtMid["JwtRequestAnalyzerMiddleware"]
+    end
+
+    subgraph App_Layer ["SteelIndustry.Application"]
+        UserApp["UserAppService"]
+        AuthApp["AuthAppService"]
+        MatApp["MaterialAppService"]
+        DTOs["DTOs (Array Responses & Metrics)"]
+    end
+
+    subgraph Domain_Layer ["SteelIndustry.Domain (Núcleo Puro)"]
+        MatEntity["Entity: Material (JsonElement)"]
+        UserEntity["Entity: User"]
+        MatRepoIntf["Interface: IMaterialRepository"]
+        UserRepoIntf["Interface: IUserRepository"]
+        CompServiceIntf["Interface: IMaterialJsonCompactorService"]
+    end
+
+    subgraph Infra_Layer ["SteelIndustry.Infrastructure"]
+        InMemoryMat["InMemoryMaterialRepository (ConcurrentDictionary)"]
+        InMemoryUser["InMemoryUserRepository (ConcurrentDictionary)"]
+        JwtGen["JwtTokenGenerator"]
+        PwdHasher["PasswordHasher (SHA256)"]
+        CompactorImpl["MaterialJsonCompactorService (Brotli / GZip / Minify)"]
+    end
+
+    %% Relações e Fluxos
+    ClientWeb --> PerfMid
+    ClientSwagger --> PerfMid
+    PerfMid --> JwtMid
+    JwtMid --> RootCtrl
+    JwtMid --> AuthCtrl
+    JwtMid --> UsersCtrl
+    JwtMid --> MatCtrl
+
+    AuthCtrl --> AuthApp
+    UsersCtrl --> UserApp
+    MatCtrl --> MatApp
+
+    UserApp --> UserRepoIntf
+    AuthApp --> UserRepoIntf
+    MatApp --> MatRepoIntf
+    MatApp --> CompServiceIntf
+
+    %% Inversão de dependência (Infrastructure implementa interfaces do Domain)
+    InMemoryMat -.->|Implementa| MatRepoIntf
+    InMemoryUser -.->|Implementa| UserRepoIntf
+    CompactorImpl -.->|Implementa| CompServiceIntf
+```
+
+---
+
+## ⚡ 2. Diagrama do Pipeline HTTP (Middlewares de Telemetria e Segurança)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Dashboard Client (Angular)
+    participant PerfMid as PerformanceMetricsMiddleware
+    participant JwtMid as JwtRequestAnalyzerMiddleware
+    participant Ctrl as MaterialsController
+    participant App as MaterialAppService
+    participant Repo as InMemoryMaterialRepository
+
+    Client->>PerfMid: Requisição HTTP (GET /api/materials)
+    Note over PerfMid: 1. Inicia Stopwatch<br/>2. Captura GC.GetTotalMemory inicial
+
+    PerfMid->>JwtMid: Encaminha para JwtRequestAnalyzer
+    Note over JwtMid: Rota é pública (/ ou login)?<br/>NÃO: Inspeciona Authorization: Bearer
+
+    alt Token Ausente ou Inválido
+        JwtMid-->>Client: Responde 401 Unauthorized (JSON padronizado)
+    else Token JWT Válido
+        Note over JwtMid: 1. Valida Assinatura HMAC-SHA256<br/>2. Preenche HttpContext.User
+        JwtMid->>Ctrl: Encaminha para Controller
+        Ctrl->>App: GetAllAsync()
+        App->>Repo: GetAllAsync()
+        Repo-->>App: Retorna Material[] da memória
+        App-->>Ctrl: Retorna MaterialDto[] (Array estruturado)
+        Ctrl-->>JwtMid: 200 OK com Payload em Array
+        JwtMid-->>PerfMid: Resposta do Pipeline
+        Note over PerfMid: 1. Finaliza Stopwatch<br/>2. Calcula delta de memória<br/>3. Injeta headers X-Response-Time-Ms e X-Memory-Allocated-Bytes
+        PerfMid-->>Client: 200 OK com Headers de Diagnóstico + Array JSON
+    end
+```
+
+---
+
+## 🗜️ 3. Fluxograma do Compactador de JSON de Materiais Siderúrgicos
+
+```mermaid
+flowchart LR
+    InputJson["JSON Bruto do Material<br/>(Laudo / Ensaio / Espectrometria)"] --> Step1["1. Medição do Tamanho Original<br/>(Encoding.UTF8.GetByteCount)"]
+    Step1 --> Step2["2. Minificação Estrutural<br/>(Utf8JsonWriter sem identação/espaços)"]
+    
+    Step2 --> Decision{"Estratégia Escolhida"}
+    
+    Decision -->|"MinificationOnly (1)"| StrategyMin["Minificação Pura<br/>(String sem perdas)"]
+    Decision -->|"GZip (2)"| StrategyGzip["Compressão GZipStream<br/>(CompressionLevel.Optimal)"]
+    Decision -->|"Brotli (3)"| StrategyBrotli["Compressão BrotliStream<br/>(Alta taxa de redução)"]
+    
+    StrategyGzip --> Base64_1["Codificação em Base64"]
+    StrategyBrotli --> Base64_2["Codificação em Base64"]
+    
+    StrategyMin --> MetricsCalc["3. Cálculo das Métricas"]
+    Base64_1 --> MetricsCalc
+    Base64_2 --> MetricsCalc
+    
+    MetricsCalc --> OutputDto["CompactedMaterialResponseDto:<br/>- OriginalSizeBytes<br/>- CompactedSizeBytes<br/>- ReductionRatioPercent<br/>- ElapsedMs<br/>- CompactedData"]
+```
+
+---
+
+## 🔐 4. Fluxo de Autenticação e Bypass na Raiz
+
+```mermaid
+flowchart TD
+    Req["Requisição Entrante"] --> CheckRoute{"Qual é a rota solicitada?"}
+    
+    CheckRoute -->|"Rota Raiz (/)"| BypassRoot["Bypass Concedido:<br/>Retorna Status da API e Telemetria"]
+    CheckRoute -->|"Swagger (/swagger)"| BypassSwagger["Bypass Concedido:<br/>Acesso à Documentação"]
+    CheckRoute -->|"Login (/api/auth/login)"| BypassLogin["Bypass Concedido:<br/>Valida credenciais e emite JWT"]
+    
+    CheckRoute -->|"Rotas Restritas (/api/materials, /api/users)"| CheckHeader{"Possui Header Authorization Bearer?"}
+    
+    CheckHeader -->|Não| Block401["Bloqueia com 401 Unauthorized"]
+    CheckHeader -->|Sim| ValidateToken{"Assinatura e Validade OK?"}
+    
+    ValidateToken -->|Expirado ou Inválido| Block401
+    ValidateToken -->|Válido| AllowRoute["Injeta Claims em HttpContext.User<br/>Executa Controller de Negócio"]
+```
+
+---
+
+## 👥 5. Diagrama de Classes e Entidades Principais
+
+```mermaid
+classDiagram
+    class User {
+        +string Id
+        +string Username
+        +string PasswordHash
+        +string FullName
+        +string Email
+        +UserRole Role
+        +bool IsActive
+        +DateTime CreatedAt
+        +UpdateProfile()
+        +SetActive()
+        +ChangePassword()
+    }
+
+    class Material {
+        +string Id
+        +string Code
+        +string SteelGrade
+        +string Standard
+        +string HeatNumber
+        +string SpecificationsJson
+        +DateTime CreatedAt
+        +DateTime UpdatedAt
+        +Update()
+        +GetSpecificationsAsJsonElement() JsonElement
+    }
+
+    class CompactedMaterialResult {
+        +int OriginalSizeBytes
+        +int CompactedSizeBytes
+        +double ReductionRatioPercent
+        +double ElapsedMs
+        +CompressionStrategy StrategyUsed
+        +string CompactedData
+    }
+
+    class UserRole {
+        <<enumeration>>
+        Operador
+        EngenheiroMetalurgista
+        Admin
+    }
+
+    class CompressionStrategy {
+        <<enumeration>>
+        MinificationOnly
+        GZip
+        Brotli
+    }
+
+    User --> UserRole
+    CompactedMaterialResult --> CompressionStrategy
+```
